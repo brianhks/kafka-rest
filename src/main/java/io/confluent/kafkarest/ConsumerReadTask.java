@@ -166,9 +166,8 @@ class ConsumerReadTask<KafkaK, KafkaV, ClientK, ClientV>
     if (e == null) {
       // Now it's safe to mark these messages as consumed by updating offsets since we're actually
       // going to return the data.
-      Map<Integer, Long> consumedOffsets = topicState.getConsumedOffsets();
       for (ConsumerRecord<ClientK, ClientV> msg : messages) {
-        consumedOffsets.put(msg.getPartition(), msg.getOffset());
+        topicState.updateOffset(msg.getPartition(), msg.getOffset());
       }
     } else {
       // If we read any messages before the exception occurred, keep this task so we don't lose

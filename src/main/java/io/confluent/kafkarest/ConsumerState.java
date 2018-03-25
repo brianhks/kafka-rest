@@ -24,6 +24,8 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import io.confluent.kafkarest.entities.TopicPartitionOffset;
+import jersey.repackaged.com.google.common.collect.ImmutableList;
+import jersey.repackaged.com.google.common.collect.ImmutableMap;
 import kafka.common.MessageStreamsExistException;
 import kafka.consumer.KafkaStream;
 import kafka.javaapi.consumer.ConsumerConnector;
@@ -42,24 +44,26 @@ public abstract class ConsumerState<KafkaK, KafkaV, ClientK, ClientV>
   private KafkaRestConfig config;
   private ConsumerInstanceId instanceId;
   private ConsumerConnector consumer;
-  private Map<String, ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV>> topics;
+  private final Object consumerLock = new Object();
+  //The underlying consumer only allows for registering for a topic once and this code
+  //only lets you pass one topic so we only need to track one topicState
+  private String topic;
+  private ConsumerTopicState topicState;
   private long expiration;
   // A read/write lock on the ConsumerState allows concurrent readTopic calls, but allows
   // commitOffsets to safely lock the entire state in order to get correct information about all
   // the topic/stream's current offset state. All operations on individual TopicStates must be
   // synchronized at that level as well (so, e.g., readTopic may modify a single TopicState, but
   // only needs read access to the ConsumerState).
-  private ReadWriteLock lock;
+  //private ReadWriteLock lock;
 
   public ConsumerState(KafkaRestConfig config, ConsumerInstanceId instanceId,
                        ConsumerConnector consumer) {
     this.config = config;
     this.instanceId = instanceId;
     this.consumer = consumer;
-    this.topics = new HashMap<String, ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV>>();
     this.expiration = config.getTime().milliseconds() +
                       config.getInt(KafkaRestConfig.CONSUMER_INSTANCE_TIMEOUT_MS_CONFIG);
-    this.lock = new ReentrantReadWriteLock();
   }
 
   public ConsumerInstanceId getId() {
@@ -104,25 +108,27 @@ public abstract class ConsumerState<KafkaK, KafkaV, ClientK, ClientV>
   }
 
   public List<TopicPartitionOffset> commitOffsets() {
-    lock.writeLock().lock();
-    try {
-      consumer.commitOffsets();
-      List<TopicPartitionOffset> result = getOffsets(true);
-      return result;
-    } finally {
-      lock.writeLock().unlock();
+
+    ImmutableList.Builder<TopicPartitionOffset> ret = ImmutableList.builder();
+    ImmutableMap<Integer, Long> stateOffsets = topicState.commitOffsets();
+    for (Map.Entry<Integer, Long> offset : stateOffsets.entrySet())
+    {
+      ret.add(new TopicPartitionOffset(topic, offset.getKey(),
+            offset.getValue(), offset.getValue()));
     }
+
+    return ret.build();
   }
 
   public void close() {
-    lock.writeLock().lock();
-    try {
+    synchronized (consumerLock)
+    {
+      topic = null;
+      topicState = null;
       consumer.shutdown();
       // Marks this state entry as no longer valid because the consumer group is being destroyed.
       consumer = null;
-      topics = null;
-    } finally {
-      lock.writeLock().unlock();
+
     }
   }
 
@@ -160,77 +166,40 @@ public abstract class ConsumerState<KafkaK, KafkaV, ClientK, ClientV>
 
   public ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> getOrCreateTopicState(String topic) {
     // Try getting the topic only using the read lock
-    lock.readLock().lock();
-    try {
-      if (topics == null) {
-        return null;
-      }
-      ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> state = topics.get(topic);
-      if (state != null) {
-        return state;
-      }
-    } finally {
-      lock.readLock().unlock();
-    }
 
-    lock.writeLock().lock();
-    try {
-      if (topics == null) {
-        return null;
-      }
-      ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> state = topics.get(topic);
-      if (state != null) {
-        return state;
+    synchronized (consumerLock)
+    {
+      if (this.topic != null && topic.equals(this.topic))
+      {
+        throw Errors.consumerAlreadySubscribedException();
       }
 
-      Map<String, Integer> subscriptions = new TreeMap<String, Integer>();
-      subscriptions.put(topic, 1);
-      Map<String, List<KafkaStream<KafkaK, KafkaV>>> streamsByTopic =
-          consumer.createMessageStreams(subscriptions, getKeyDecoder(), getValueDecoder());
-      KafkaStream<KafkaK, KafkaV> stream = streamsByTopic.get(topic).get(0);
-      state = new ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV>(stream);
-      topics.put(topic, state);
-      return state;
-    } catch (MessageStreamsExistException e) {
-      throw Errors.consumerAlreadySubscribedException();
-    } finally {
-      lock.writeLock().unlock();
-    }
-  }
+      if (topicState != null)
+      {
+        return topicState;
+      }
 
-  /**
-   * Gets a list of TopicPartitionOffsets describing the current state of consumer offsets, possibly
-   * updating the commmitted offset record. This method is not synchronized.
-   *
-   * @param updateCommitOffsets if true, updates committed offsets to be the same as the consumed
-   *                            offsets.
-   */
-  private List<TopicPartitionOffset> getOffsets(boolean updateCommitOffsets) {
-    List<TopicPartitionOffset> result = new Vector<TopicPartitionOffset>();
-    for (Map.Entry<String, ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV>> entry
-        : topics.entrySet()) {
-      ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> state = entry.getValue();
-      state.lock();
-      try {
-        for (Map.Entry<Integer, Long> partEntry : state.getConsumedOffsets().entrySet()) {
-          Integer partition = partEntry.getKey();
-          Long offset = partEntry.getValue();
-          Long committedOffset = 0L;
-          if (updateCommitOffsets) {
-            state.getCommittedOffsets().put(partition, offset);
-            committedOffset = offset;
-          } else {
-            committedOffset = state.getCommittedOffsets().get(partition);
-          }
-          result.add(new TopicPartitionOffset(entry.getKey(), partition,
-                                              offset,
-                                              (committedOffset == null ? -1 : committedOffset)));
-        }
-      } finally {
-        state.unlock();
+      if (consumer == null)
+      {
+        return null;  //we are shutting down
+      }
+
+      try
+      {
+        Map<String, Integer> subscriptions = new TreeMap<String, Integer>();
+        subscriptions.put(topic, 1);
+        Map<String, List<KafkaStream<KafkaK, KafkaV>>> streamsByTopic =
+              consumer.createMessageStreams(subscriptions, getKeyDecoder(), getValueDecoder());
+        KafkaStream<KafkaK, KafkaV> stream = streamsByTopic.get(topic).get(0);
+        topicState = new ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV>(consumer, stream);
+        this.topic = topic;
+        return topicState;
+      }
+      catch (MessageStreamsExistException e)
+      {
+        throw Errors.consumerAlreadySubscribedException();
       }
     }
-    return result;
   }
 
 }

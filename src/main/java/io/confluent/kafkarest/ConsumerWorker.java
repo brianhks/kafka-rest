@@ -42,11 +42,13 @@ public class ConsumerWorker extends Thread {
   Queue<ConsumerReadTask> waitingTasks =
       new PriorityQueue<ConsumerReadTask>(1, new ReadTaskExpirationComparator());
 
+  Object taskLock = new Object();
+
   public ConsumerWorker(KafkaRestConfig config) {
     this.config = config;
   }
 
-  public synchronized <KafkaK, KafkaV, ClientK, ClientV>
+  public <KafkaK, KafkaV, ClientK, ClientV>
   Future readTopic(ConsumerState state, String topic, long maxBytes,
                    ConsumerWorkerReadCallback<ClientK, ClientV> callback) {
     log.trace("Consumer worker " + this.toString() + " reading topic " + topic
@@ -54,8 +56,11 @@ public class ConsumerWorker extends Thread {
     ConsumerReadTask<KafkaK, KafkaV, ClientK, ClientV> task
         = new ConsumerReadTask<KafkaK, KafkaV, ClientK, ClientV>(state, topic, maxBytes, callback);
     if (!task.isDone()) {
-      tasks.add(task);
-      this.notifyAll();
+      synchronized (taskLock)
+      {
+        tasks.add(task);
+        taskLock.notifyAll();
+      }
     }
     return task;
   }
@@ -64,7 +69,7 @@ public class ConsumerWorker extends Thread {
   public void run() {
     while (isRunning.get()) {
       ConsumerReadTask task = null;
-      synchronized (this) {
+      synchronized (taskLock) {
         if (tasks.isEmpty()) {
           try {
             long now = config.getTime().milliseconds();

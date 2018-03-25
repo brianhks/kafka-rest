@@ -21,8 +21,11 @@ import java.util.Map;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import jersey.repackaged.com.google.common.collect.ImmutableMap;
 import kafka.consumer.ConsumerIterator;
 import kafka.consumer.KafkaStream;
+import kafka.javaapi.consumer.ConsumerConnector;
+import kafka.message.MessageAndMetadata;
 
 /**
  * Tracks a consumer's state for a single topic, including the underlying stream and consumed and
@@ -31,27 +34,22 @@ import kafka.consumer.KafkaStream;
  */
 public class ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> {
 
-  private final Lock lock = new ReentrantLock();
   private final KafkaStream<KafkaK, KafkaV> stream;
   private final Map<Integer, Long> consumedOffsets;
   private final Map<Integer, Long> committedOffsets;
+  private final ConsumerConnector consumer;
+
+  private final Object offsetLock = new Object();
 
   // The last read task on this topic that failed. Allows the next read to pick up where this one
   // left off, including accounting for response size limits
   private ConsumerReadTask failedTask;
 
-  public ConsumerTopicState(KafkaStream<KafkaK, KafkaV> stream) {
+  public ConsumerTopicState(ConsumerConnector consumer, KafkaStream<KafkaK, KafkaV> stream) {
+    this.consumer = consumer;
     this.stream = stream;
     this.consumedOffsets = new HashMap<Integer, Long>();
     this.committedOffsets = new HashMap<Integer, Long>();
-  }
-
-  public void lock() {
-    lock.lock();
-  }
-
-  public void unlock() {
-    lock.unlock();
   }
 
   public KafkaStream<KafkaK, KafkaV> getStream() {
@@ -62,12 +60,29 @@ public class ConsumerTopicState<KafkaK, KafkaV, ClientK, ClientV> {
     return stream.iterator();
   }
 
-  public Map<Integer, Long> getConsumedOffsets() {
-    return consumedOffsets;
+  public void updateOffset(int partition, long offset)
+  {
+    //lock this
+    synchronized (offsetLock)
+    {
+      consumedOffsets.put(partition, offset);
+    }
   }
 
-  public Map<Integer, Long> getCommittedOffsets() {
-    return committedOffsets;
+  /**
+
+   */
+  public ImmutableMap<Integer, Long> commitOffsets()
+  {
+    ImmutableMap ret;
+
+    synchronized (offsetLock)
+    {
+      consumer.commitOffsets();
+      committedOffsets.putAll(consumedOffsets);
+      ret = ImmutableMap.copyOf(committedOffsets);
+    }
+    return ret;
   }
 
   public ConsumerReadTask clearFailedTask() {
